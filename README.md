@@ -5,6 +5,12 @@
 writing image, video, and document metadata. The service checks for ExifTool
 at startup and refuses to start without it.
 
+It removes metadata such as location, camera, and capture time from images
+while keeping the ICC color profile and orientation, so a stripped photo looks
+the same as the original. Pixel data is never re-encoded. A fixed pool of
+ExifTool processes runs in `-stay_open` mode, so each request skips Perl's
+startup and memory does not grow with the number of callers.
+
 ## Requirements
 
 - Go 1.27 or newer
@@ -32,7 +38,15 @@ The server listens on `:8080`. These environment variables are available:
 | --- | --- | --- |
 | `ADDR` | `:8080` | HTTP listen address |
 | `EXIFTOOL_PATH` | `exiftool` | ExifTool executable, either a path or a name looked up on `PATH` |
+| `MAX_CONCURRENT_STRIPS` | available CPUs | Number of ExifTool processes, and so of files stripped concurrently |
+| `STRIP_TIMEOUT` | `30s` | Maximum lifetime of a strip request, including upload and queue waits |
+| `MAX_REQUEST_SIZE` | `25MiB` | Maximum `/strip` request body, including multipart overhead |
 | `SHUTDOWN_TIMEOUT` | `30s` | Grace period for active requests during shutdown |
+
+Each ExifTool process uses about 20–35 MiB, so memory depends on
+`MAX_CONCURRENT_STRIPS`, not on how many clients call the service. With four
+processes, the container used about 140 MiB while serving 400 requests, 40 at
+a time, at a p95 latency of 34 ms for a 150 KB JPEG.
 
 ## Docker
 
@@ -76,7 +90,40 @@ curl -sS http://localhost:8080/readyz
 
 `/livez` reports that the process is running. `/readyz` reports whether the
 service accepts requests and returns 503 as soon as graceful shutdown starts.
-`/healthz` is an alias for `/readyz`.
+`/healthz` is an alias for `/readyz`. The service only starts listening after
+every ExifTool process has started.
+
+Send a file to strip as the raw request body:
+
+```sh
+curl -sS -X POST http://localhost:8080/strip \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary '@photo.jpg' -o stripped.jpg
+```
+
+Or as a multipart `file` field:
+
+```sh
+curl -sS -X POST http://localhost:8080/strip \
+  -F 'file=@photo.jpg' -o stripped.jpg
+```
+
+A successful response is `200` with the stripped file as
+`application/octet-stream`. The format is detected from the content, so a
+renamed file is still stripped. Errors are JSON with an `error` message:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Missing or invalid body |
+| `413` | Body is larger than `MAX_REQUEST_SIZE` |
+| `422` | ExifTool cannot rewrite the file: the format is not writable or the file is corrupt |
+| `499` | The client cancelled the request |
+| `500` | ExifTool failed; its process is replaced before the next request uses it |
+| `503` | The service is shutting down; retry after `Retry-After` |
+| `504` | The request took longer than `STRIP_TIMEOUT` |
+
+Callers that must not lose an upload should keep the original file on any
+response other than `200`.
 
 ## Telemetry and shutdown
 
@@ -86,13 +133,18 @@ letters, digits, `_`, or `-` and is at most 64 characters. Logs never include
 request bodies, query strings, or request headers.
 
 Prometheus metrics are exposed at `/metrics`. They cover HTTP request rates and
-latency, Go runtime and process statistics, and build information including the
-ExifTool version. Keep this endpoint private at the ingress layer.
+latency, strip stage latency and outcomes, active ExifTool commands,
+cancellations, Go runtime and process statistics, and build information
+including the ExifTool version. Keep this endpoint private at the ingress layer.
+
+Every strip request has a deadline. A request that times out or is cancelled
+stops its ExifTool process, which is started again the next time it is needed,
+so one stuck file never blocks other requests.
 
 On SIGINT or SIGTERM, readiness becomes false immediately, and active requests
 have `SHUTDOWN_TIMEOUT` to finish. After that, request contexts are cancelled
-and connections are closed. Set the orchestrator's termination grace period
-longer than `SHUTDOWN_TIMEOUT`.
+and connections are closed, and the ExifTool processes are stopped. Set the
+orchestrator's termination grace period longer than `SHUTDOWN_TIMEOUT`.
 
 ## Contributing
 

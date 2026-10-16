@@ -26,15 +26,22 @@ Run the unit tests with:
 make test
 ```
 
-They need neither ExifTool nor network access. To also run the tests against
-the pinned ExifTool release:
+They need neither ExifTool nor network access: a fake stripper covers raw and
+multipart uploads, request limits, error responses, deadlines and cancellation,
+bounded uploads and concurrency, temporary file cleanup, and shutdown. To also
+run the tests against the pinned ExifTool release:
 
 ```sh
 make test-integration
 ```
 
 This downloads and verifies ExifTool if it is missing. The integration suite
-fails rather than silently skipping when ExifTool is unavailable.
+tags JPEG and PNG files with a location, camera, and capture time, strips them,
+and checks that every private tag is gone while the orientation and ICC profile
+are kept. It also covers files ExifTool cannot rewrite, recovery after a timeout
+or an exited process, concurrent requests, and that a failed startup leaves no
+processes behind. It fails rather than silently skipping when ExifTool is
+unavailable.
 
 ## Upgrading ExifTool
 
@@ -48,4 +55,5 @@ checksums in the author's
 
 ```text
 cmd/exiftool-server/   HTTP server, lifecycle, and telemetry
+internal/exiftool/     ExifTool process pool and metadata removal
 ```
