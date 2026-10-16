@@ -24,7 +24,7 @@ type telemetry struct {
 	cancellations *prometheus.CounterVec
 }
 
-func newTelemetry(exiftoolVersion string) *telemetry {
+func newTelemetry(exiftoolVersion string, maxConcurrentStrips int) *telemetry {
 	registry := prometheus.NewRegistry()
 	t := &telemetry{
 		registry: registry,
@@ -62,9 +62,10 @@ func newTelemetry(exiftoolVersion string) *telemetry {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Namespace: "exiftool", Name: "build_info", Help: "Build and ExifTool version.",
+		Namespace: "exiftool", Name: "build_info", Help: "Build, ExifTool version, and pool size.",
 		ConstLabels: prometheus.Labels{
 			"version": version, "commit": commit, "exiftool_version": exiftoolVersion,
+			"max_concurrent_strips": strconv.Itoa(maxConcurrentStrips),
 		},
 	}, func() float64 { return 1 }))
 	return t

@@ -27,7 +27,7 @@ import (
 const (
 	defaultExiftoolPath    = "exiftool"
 	defaultMaxRequestBytes = 25 << 20 // 25 MiB: Appwrite strips files up to 20 MB, plus multipart overhead.
-	maxConcurrentUploads   = 4        // Bounds buffered bodies without reserving a process.
+	maxConcurrentUploads   = 4        // Bounds uploads in progress without reserving a process.
 	defaultStripTimeout    = 30 * time.Second
 	defaultShutdownTimeout = 30 * time.Second
 	exiftoolStartupTimeout = 10 * time.Second
@@ -164,7 +164,7 @@ func newApplication(exiftoolVersion string, stripper stripper, maxConcurrentStri
 		stripper:        stripper,
 		uploadSlots:     make(chan struct{}, maxConcurrentUploads),
 		stripSlots:      make(chan struct{}, maxConcurrentStrips),
-		telemetry:       newTelemetry(exiftoolVersion),
+		telemetry:       newTelemetry(exiftoolVersion, maxConcurrentStrips),
 		stripTimeout:    defaultStripTimeout,
 		maxRequestBytes: defaultMaxRequestBytes,
 	}
@@ -255,15 +255,36 @@ func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// No extension, so ExifTool detects the format from the content and a
+	// renamed file is still stripped.
+	file, err := os.CreateTemp(app.tempDir, "strip-*")
+	if err != nil {
+		outcome = "internal_error"
+		slog.Error("create temporary file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	path := file.Name()
+	defer os.Remove(path)
+
+	// The upload goes straight to the file ExifTool rewrites, so memory does not
+	// grow with file size.
 	r.Body = http.MaxBytesReader(w, r.Body, app.maxRequestBytes)
 	defer r.Body.Close()
-	data, err := readFile(r)
-	if err != nil {
+	upload := &fileWriter{file: file}
+	receiveErr := receiveFile(r, upload)
+	if err := errors.Join(upload.err, file.Close()); err != nil {
+		outcome = "internal_error"
+		slog.Error("write temporary file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	if receiveErr != nil {
 		// The server's read deadline starts before this handler, so a slow upload
 		// can hit it first. The server then also cancels the request context,
 		// which would otherwise look like the client leaving.
 		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
+		if errors.As(receiveErr, &netErr) && netErr.Timeout() {
 			outcome = "timeout"
 			app.telemetry.cancellations.WithLabelValues("deadline").Inc()
 			writeError(w, http.StatusGatewayTimeout, "strip timed out")
@@ -276,12 +297,12 @@ func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
 		}
 		outcome = "invalid_request"
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		if errors.As(receiveErr, &tooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("file exceeds the %s request limit", formatByteSize(app.maxRequestBytes)))
 			return
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, receiveErr.Error())
 		return
 	}
 	stripWaitStarted := time.Now()
@@ -294,29 +315,10 @@ func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
 		writeContextError(w, ctx)
 		return
 	}
-	// Keep the upload slot while waiting for a process so buffered request bodies
-	// remain bounded. Release it once the strip slot is secured.
+	// Keep the upload slot while waiting for a process so the uploads waiting on
+	// disk remain bounded. Release it once the strip slot is secured.
 	<-app.uploadSlots
 	uploadSlotHeld = false
-
-	// No extension, so ExifTool detects the format from the content and a
-	// renamed file is still stripped.
-	file, err := os.CreateTemp(app.tempDir, "strip-*")
-	if err != nil {
-		outcome = "internal_error"
-		slog.Error("create temporary file failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "strip failed")
-		return
-	}
-	path := file.Name()
-	defer os.Remove(path)
-	_, writeErr := file.Write(data)
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		outcome = "internal_error"
-		slog.Error("write temporary file failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "strip failed")
-		return
-	}
 
 	stripStarted := time.Now()
 	app.telemetry.stripActive.Inc()
@@ -340,19 +342,42 @@ func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stripped, err := os.ReadFile(path)
-	if err != nil || len(stripped) == 0 {
+	stripped, err := os.Open(path)
+	if err != nil {
 		outcome = "internal_error"
-		slog.Error("read stripped file failed", "error", err, "bytes", len(stripped))
+		slog.Error("open stripped file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	defer stripped.Close()
+	info, err := stripped.Stat()
+	if err != nil || info.Size() == 0 {
+		outcome = "internal_error"
+		slog.Error("stripped file is unreadable or empty", "error", err)
 		writeError(w, http.StatusInternalServerError, "strip failed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(stripped)))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(stripped); err != nil {
+	if _, err := io.Copy(w, stripped); err != nil {
 		slog.Error("write response failed", "error", err)
 	}
+}
+
+// fileWriter keeps the temporary file's write error apart from upload errors,
+// so a full disk is not reported as a bad request.
+type fileWriter struct {
+	file *os.File
+	err  error
+}
+
+func (w *fileWriter) Write(data []byte) (int, error) {
+	n, err := w.file.Write(data)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 func writeContextError(w http.ResponseWriter, ctx context.Context) {
@@ -363,28 +388,28 @@ func writeContextError(w http.ResponseWriter, ctx context.Context) {
 	writeError(w, 499, "request cancelled")
 }
 
-func readFile(r *http.Request) ([]byte, error) {
+func receiveFile(r *http.Request, dst io.Writer) error {
 	contentType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
-		return nil, errors.New("invalid Content-Type header")
+		return errors.New("invalid Content-Type header")
 	}
 	if contentType != "multipart/form-data" {
-		data, err := io.ReadAll(r.Body)
+		written, err := io.Copy(dst, r.Body)
 		if err != nil {
-			return nil, fmt.Errorf("read file: %w", err)
+			return fmt.Errorf("read file: %w", err)
 		}
-		if len(data) == 0 {
-			return nil, errors.New("empty file body")
+		if written == 0 {
+			return errors.New("empty file body")
 		}
-		return data, nil
+		return nil
 	}
 
 	if params["boundary"] == "" {
-		return nil, errors.New("multipart boundary is missing")
+		return errors.New("multipart boundary is missing")
 	}
 	reader, err := r.MultipartReader()
 	if err != nil {
-		return nil, fmt.Errorf("read multipart body: %w", err)
+		return fmt.Errorf("read multipart body: %w", err)
 	}
 	for {
 		part, err := reader.NextPart()
@@ -392,23 +417,23 @@ func readFile(r *http.Request) ([]byte, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read multipart body: %w", err)
+			return fmt.Errorf("read multipart body: %w", err)
 		}
 		if part.FormName() != "file" {
 			part.Close()
 			continue
 		}
-		data, readErr := io.ReadAll(part)
+		written, copyErr := io.Copy(dst, part)
 		part.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("read file field: %w", readErr)
+		if copyErr != nil {
+			return fmt.Errorf("read file field: %w", copyErr)
 		}
-		if len(data) == 0 {
-			return nil, errors.New("file field is empty")
+		if written == 0 {
+			return errors.New("file field is empty")
 		}
-		return data, nil
+		return nil
 	}
-	return nil, errors.New("multipart field \"file\" is required")
+	return errors.New("multipart field \"file\" is required")
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

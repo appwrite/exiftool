@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,31 +90,38 @@ func readTags(t *testing.T, path string) map[string]any {
 	return tags[0]
 }
 
+// assertNoPrivateTags checks every group, since a format without EXIF, like
+// GIF, stores the same tags in XMP.
 func assertNoPrivateTags(t *testing.T, tags map[string]any) {
 	t.Helper()
-	for _, key := range []string{
-		"EXIF:GPSLatitude", "EXIF:GPSLongitude", "Composite:GPSLatitude",
-		"EXIF:Make", "EXIF:Model", "EXIF:DateTimeOriginal", "XMP:Creator",
-	} {
-		if value, ok := tags[key]; ok {
-			t.Errorf("%s = %v was not removed", key, value)
+	for key, value := range tags {
+		for _, name := range []string{"GPSLatitude", "GPSLongitude", "Make", "Model", "DateTimeOriginal", "Creator"} {
+			if strings.HasSuffix(key, ":"+name) {
+				t.Errorf("%s = %v was not removed", key, value)
+			}
 		}
 	}
 }
 
 func TestStripRemovesMetadata(t *testing.T) {
 	pool := newPool(t, 1)
-	for _, tt := range []struct {
+	// The formats Appwrite strips; HEIC covers HEIF.
+	for _, tc := range []struct {
 		name string
 		data []byte
 	}{
 		{"jpeg", warmUpJPEG},
 		{"png", testPNG(t)},
+		{"tiff", readFixture(t, "photo.tiff")},
+		{"gif", readFixture(t, "photo.gif")},
+		{"webp", readFixture(t, "photo.webp")},
+		{"avif", readFixture(t, "photo.avif")},
+		{"heic", readFixture(t, "photo.heic")},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			// No extension: the format must come from the content.
-			path := writeFixture(t, "upload", tt.data, privateTags...)
-			if _, ok := readTags(t, path)["EXIF:Make"]; !ok {
+			path := writeFixture(t, "upload", tc.data, append([]string{"-Orientation#=6"}, privateTags...)...)
+			if !hasTag(readTags(t, path), "Make", "Canon") {
 				t.Fatal("fixture was not tagged")
 			}
 
@@ -121,9 +129,33 @@ func TestStripRemovesMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			assertNoPrivateTags(t, readTags(t, path))
+			tags := readTags(t, path)
+			assertNoPrivateTags(t, tags)
+			if !hasTag(tags, "Orientation", float64(6)) {
+				t.Errorf("orientation was removed: %v", tags)
+			}
 		})
 	}
+}
+
+// readFixture reads an untagged image generated with ImageMagick.
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// hasTag reports whether any group, such as EXIF or XMP, holds the tag with this value.
+func hasTag(tags map[string]any, name string, want any) bool {
+	for key, value := range tags {
+		if strings.HasSuffix(key, ":"+name) && value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestStripKeepsOrientationAndColorProfile(t *testing.T) {

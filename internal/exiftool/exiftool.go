@@ -149,10 +149,7 @@ func (p *Pool) Strip(ctx context.Context, path string) error {
 	}
 	p.processes <- proc
 
-	if !stripped(output) {
-		return ErrNotStripped
-	}
-	return nil
+	return parseStatus(output)
 }
 
 // Close stops every process, waiting for strips in progress to finish.
@@ -193,18 +190,31 @@ func (p *Pool) start(ctx context.Context) (*process, error) {
 
 func stripArguments(path string) []string {
 	return []string{
+		// Print only the exit status: 0 when the file was written or had
+		// nothing to remove, 1 when it could not be rewritten.
+		"-q", "-q",
+		"-echo3", "${status}",
 		"-all=",
 		"-tagsfromfile", "@",
 		"-icc_profile",
 		"-orientation",
+		// -all= can't delete a TIFF's first IFD, which holds the image data, so
+		// this clears the camera and other common tags left in it.
+		"-CommonIFD0=",
 		"-overwrite_original",
 		path,
 	}
 }
 
-func stripped(output string) bool {
-	return strings.Contains(output, "1 image files updated") ||
-		strings.Contains(output, "1 image files unchanged")
+func parseStatus(output string) error {
+	switch strings.TrimSpace(output) {
+	case "0":
+		return nil
+	case "1":
+		return ErrNotStripped
+	default:
+		return fmt.Errorf("unexpected exiftool output %q", output)
+	}
 }
 
 type process struct {
@@ -247,8 +257,8 @@ func (p *process) warmUp(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !stripped(output) {
-		return errors.New("exiftool could not strip the warm-up image")
+	if err := parseStatus(output); err != nil {
+		return fmt.Errorf("strip the warm-up image: %w", err)
 	}
 	return nil
 }

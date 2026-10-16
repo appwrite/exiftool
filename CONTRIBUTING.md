@@ -36,9 +36,12 @@ make test-integration
 ```
 
 This downloads and verifies ExifTool if it is missing. The integration suite
-tags JPEG and PNG files with a location, camera, and capture time, strips them,
-and checks that every private tag is gone while the orientation and ICC profile
-are kept. It also covers files ExifTool cannot rewrite, recovery after a timeout
+tags JPEG, PNG, TIFF, GIF, WebP, AVIF, and HEIC files with a location, camera,
+and capture time, strips them, and checks that every private tag is gone while
+the orientation is kept. A JPEG also checks that its ICC profile is kept byte
+for byte. The non-JPEG and non-PNG fixtures in `internal/exiftool/testdata`
+are 32x24 gradients made with ImageMagick 7.1
+(`magick -size 32x24 gradient:red-blue photo.<format>`). It also covers files ExifTool cannot rewrite, recovery after a timeout
 or an exited process, concurrent requests, and that a failed startup leaves no
 processes behind. It fails rather than silently skipping when ExifTool is
 unavailable.

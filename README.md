@@ -7,9 +7,12 @@ at startup and refuses to start without it.
 
 It removes metadata such as location, camera, and capture time from images
 while keeping the ICC color profile and orientation, so a stripped photo looks
-the same as the original. Pixel data is never re-encoded. A fixed pool of
-ExifTool processes runs in `-stay_open` mode, so each request skips Perl's
-startup and memory does not grow with the number of callers.
+the same as the original. Pixel data is never re-encoded. JPEG, PNG, TIFF, GIF,
+WebP, AVIF, and HEIC are tested. A fixed pool of ExifTool processes runs in
+`-stay_open` mode, so each request skips Perl's startup and memory does not
+grow with the number of callers. Uploads are written straight to a temporary
+file and the response is sent from it, so memory does not grow with file size
+either.
 
 ## Requirements
 
@@ -40,13 +43,14 @@ The server listens on `:8080`. These environment variables are available:
 | `EXIFTOOL_PATH` | `exiftool` | ExifTool executable, either a path or a name looked up on `PATH` |
 | `MAX_CONCURRENT_STRIPS` | available CPUs | Number of ExifTool processes, and so of files stripped concurrently |
 | `STRIP_TIMEOUT` | `30s` | Maximum lifetime of a strip request, including upload and queue waits |
-| `MAX_REQUEST_SIZE` | `25MiB` | Maximum `/strip` request body, including multipart overhead |
+| `MAX_REQUEST_SIZE` | `25MiB` | Maximum `/strip` request body, including multipart overhead. Uploads are kept on disk, so this caps temporary files, not memory |
 | `SHUTDOWN_TIMEOUT` | `30s` | Grace period for active requests during shutdown |
 
-Each ExifTool process uses about 20–35 MiB, so memory depends on
-`MAX_CONCURRENT_STRIPS`, not on how many clients call the service. With four
-processes, the container used about 140 MiB while serving 400 requests, 40 at
-a time, at a p95 latency of 34 ms for a 150 KB JPEG.
+Each ExifTool process uses about 50 MiB, so memory depends on
+`MAX_CONCURRENT_STRIPS`, not on how many clients call the service or how
+large their files are. With eight processes and 16 concurrent 18 MB uploads,
+the HTTP server itself peaked at 14 MiB, and 340 requests for 320 KB JPEGs, 34
+at a time, completed at about 385 per second with a p95 of about 110 ms.
 
 ## Docker
 

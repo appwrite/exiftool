@@ -109,7 +109,7 @@ func TestMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`exiftool_build_info{commit="unknown",exiftool_version="13.55",version="dev"} 1`,
+		`exiftool_build_info{commit="unknown",exiftool_version="13.55",max_concurrent_strips="1",version="dev"} 1`,
 		`exiftool_http_requests_total{method="GET",route="unmatched",status="404"} 1`,
 	} {
 		if !strings.Contains(string(body), want) {
