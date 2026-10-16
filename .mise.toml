@@ -1,0 +1,30 @@
+[tools]
+go = "1.27.2"
+
+[tasks.fmt]
+description = "Check Go formatting"
+run = "test -z \"$(gofmt -l cmd)\""
+
+[tasks.vet]
+description = "Run static analysis"
+run = "go vet ./..."
+
+[tasks.test]
+description = "Run tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.build]
+description = "Build the service"
+run = "go build -o exiftool-server ./cmd/exiftool-server"
+
+[tasks.exiftool]
+description = "Download and verify ExifTool"
+run = "make exiftool"
+
+[tasks.test-integration]
+description = "Test against the pinned ExifTool release"
+run = "make test-integration"
+
+[tasks.ci]
+description = "Run all CI checks"
+depends = ["fmt", "vet", "test", "build"]
