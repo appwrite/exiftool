@@ -5,20 +5,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
+	"mime"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"exiftool/internal/exiftool"
 )
 
 const (
 	defaultExiftoolPath    = "exiftool"
+	defaultMaxRequestBytes = 25 << 20 // 25 MiB: Appwrite strips files up to 20 MB, plus multipart overhead.
+	maxConcurrentUploads   = 4        // Bounds uploads in progress without reserving a process.
+	defaultStripTimeout    = 30 * time.Second
 	defaultShutdownTimeout = 30 * time.Second
 	exiftoolStartupTimeout = 10 * time.Second
 )
@@ -28,9 +38,20 @@ var (
 	commit  = "unknown"
 )
 
+type stripper interface {
+	// Strip rewrites the file at path in place without its metadata.
+	Strip(context.Context, string) error
+}
+
 type application struct {
 	exiftoolVersion string
+	stripper        stripper
+	uploadSlots     chan struct{}
+	stripSlots      chan struct{}
 	telemetry       *telemetry
+	stripTimeout    time.Duration
+	maxRequestBytes int64
+	tempDir         string
 	draining        atomic.Bool
 }
 
@@ -53,7 +74,19 @@ func main() {
 func run() error {
 	addr := envOrDefault("ADDR", ":8080")
 	exiftoolPath := envOrDefault("EXIFTOOL_PATH", defaultExiftoolPath)
+	maxConcurrentStrips, err := positiveEnvInt("MAX_CONCURRENT_STRIPS", runtime.GOMAXPROCS(0))
+	if err != nil {
+		return fmt.Errorf("startup: %w", err)
+	}
+	stripTimeout, err := positiveEnvDuration("STRIP_TIMEOUT", defaultStripTimeout)
+	if err != nil {
+		return fmt.Errorf("startup: %w", err)
+	}
 	shutdownTimeout, err := positiveEnvDuration("SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
+	if err != nil {
+		return fmt.Errorf("startup: %w", err)
+	}
+	maxRequestBytes, err := positiveEnvBytes("MAX_REQUEST_SIZE", defaultMaxRequestBytes)
 	if err != nil {
 		return fmt.Errorf("startup: %w", err)
 	}
@@ -66,13 +99,28 @@ func run() error {
 	}
 	slog.Info("exiftool found", "path", exiftoolPath, "version", exiftoolVersion)
 
-	app := newApplication(exiftoolVersion)
+	started := time.Now()
+	pool, err := exiftool.New(context.Background(), exiftool.Options{
+		Binary:         exiftoolPath,
+		Size:           maxConcurrentStrips,
+		StartupTimeout: exiftoolStartupTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("startup: %w", err)
+	}
+	defer pool.Close()
+	slog.Info("exiftool processes started", "processes", maxConcurrentStrips,
+		"duration_ms", time.Since(started).Milliseconds())
+
+	app := newApplication(exiftoolVersion, pool, maxConcurrentStrips)
+	app.stripTimeout = stripTimeout
+	app.maxRequestBytes = maxRequestBytes
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           app.telemetry.instrument(app.routes()),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      35 * time.Second,
+		ReadTimeout:       stripTimeout,
+		WriteTimeout:      stripTimeout + 5*time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	serviceCtx, cancelService := context.WithCancel(context.Background())
@@ -84,7 +132,7 @@ func run() error {
 	defer signal.Stop(shutdownSignals)
 	serverErrors := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "address", addr)
+		slog.Info("listening", "address", addr, "max_request_bytes", maxRequestBytes)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrors <- err
 		}
@@ -110,15 +158,21 @@ func run() error {
 	return nil
 }
 
-func newApplication(exiftoolVersion string) *application {
+func newApplication(exiftoolVersion string, stripper stripper, maxConcurrentStrips int) *application {
 	return &application{
 		exiftoolVersion: exiftoolVersion,
-		telemetry:       newTelemetry(exiftoolVersion),
+		stripper:        stripper,
+		uploadSlots:     make(chan struct{}, maxConcurrentUploads),
+		stripSlots:      make(chan struct{}, maxConcurrentStrips),
+		telemetry:       newTelemetry(exiftoolVersion, maxConcurrentStrips),
+		stripTimeout:    defaultStripTimeout,
+		maxRequestBytes: defaultMaxRequestBytes,
 	}
 }
 
 func (app *application) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/strip", app.handleStrip)
 	mux.HandleFunc("/livez", app.handleLivez)
 	mux.HandleFunc("/readyz", app.handleReadyz)
 	mux.HandleFunc("/healthz", app.handleReadyz)
@@ -153,11 +207,233 @@ func (app *application) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if app.exiftoolVersion == "" || app.draining.Load() {
+	if app.exiftoolVersion == "" || app.stripper == nil || app.draining.Load() {
 		writeError(w, http.StatusServiceUnavailable, "service not ready")
 		return
 	}
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+}
+
+func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if app.draining.Load() {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "service is shutting down")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), app.stripTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
+	outcome := "success"
+	defer func() { app.telemetry.strips.WithLabelValues(outcome).Inc() }()
+	observeCancellation := func() {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			outcome = "timeout"
+			app.telemetry.cancellations.WithLabelValues("deadline").Inc()
+		} else {
+			outcome = "cancelled"
+			app.telemetry.cancellations.WithLabelValues("client").Inc()
+		}
+	}
+	uploadWaitStarted := time.Now()
+	select {
+	case app.uploadSlots <- struct{}{}:
+		app.telemetry.stageDuration.WithLabelValues("upload_queue").Observe(time.Since(uploadWaitStarted).Seconds())
+	case <-ctx.Done():
+		observeCancellation()
+		writeContextError(w, ctx)
+		return
+	}
+	uploadSlotHeld := true
+	defer func() {
+		if uploadSlotHeld {
+			<-app.uploadSlots
+		}
+	}()
+
+	// No extension, so ExifTool detects the format from the content and a
+	// renamed file is still stripped.
+	file, err := os.CreateTemp(app.tempDir, "strip-*")
+	if err != nil {
+		outcome = "internal_error"
+		slog.Error("create temporary file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	path := file.Name()
+	defer os.Remove(path)
+
+	// The upload goes straight to the file ExifTool rewrites, so memory does not
+	// grow with file size.
+	r.Body = http.MaxBytesReader(w, r.Body, app.maxRequestBytes)
+	defer r.Body.Close()
+	upload := &fileWriter{file: file}
+	receiveErr := receiveFile(r, upload)
+	if err := errors.Join(upload.err, file.Close()); err != nil {
+		outcome = "internal_error"
+		slog.Error("write temporary file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	if receiveErr != nil {
+		// The server's read deadline starts before this handler, so a slow upload
+		// can hit it first. The server then also cancels the request context,
+		// which would otherwise look like the client leaving.
+		var netErr net.Error
+		if errors.As(receiveErr, &netErr) && netErr.Timeout() {
+			outcome = "timeout"
+			app.telemetry.cancellations.WithLabelValues("deadline").Inc()
+			writeError(w, http.StatusGatewayTimeout, "strip timed out")
+			return
+		}
+		if ctx.Err() != nil {
+			observeCancellation()
+			writeContextError(w, ctx)
+			return
+		}
+		outcome = "invalid_request"
+		var tooLarge *http.MaxBytesError
+		if errors.As(receiveErr, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("file exceeds the %s request limit", formatByteSize(app.maxRequestBytes)))
+			return
+		}
+		writeError(w, http.StatusBadRequest, receiveErr.Error())
+		return
+	}
+	stripWaitStarted := time.Now()
+	select {
+	case app.stripSlots <- struct{}{}:
+		app.telemetry.stageDuration.WithLabelValues("strip_queue").Observe(time.Since(stripWaitStarted).Seconds())
+		defer func() { <-app.stripSlots }()
+	case <-ctx.Done():
+		observeCancellation()
+		writeContextError(w, ctx)
+		return
+	}
+	// Keep the upload slot while waiting for a process so the uploads waiting on
+	// disk remain bounded. Release it once the strip slot is secured.
+	<-app.uploadSlots
+	uploadSlotHeld = false
+
+	stripStarted := time.Now()
+	app.telemetry.stripActive.Inc()
+	err = app.stripper.Strip(ctx, path)
+	app.telemetry.stripActive.Dec()
+	app.telemetry.stageDuration.WithLabelValues("strip").Observe(time.Since(stripStarted).Seconds())
+	if err != nil {
+		if ctx.Err() != nil {
+			observeCancellation()
+			writeContextError(w, ctx)
+			return
+		}
+		if errors.Is(err, exiftool.ErrNotStripped) {
+			outcome = "not_stripped"
+			writeError(w, http.StatusUnprocessableEntity, "file format is not supported or the file is corrupt")
+			return
+		}
+		outcome = "strip_error"
+		slog.Error("strip failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+
+	stripped, err := os.Open(path)
+	if err != nil {
+		outcome = "internal_error"
+		slog.Error("open stripped file failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	defer stripped.Close()
+	info, err := stripped.Stat()
+	if err != nil || info.Size() == 0 {
+		outcome = "internal_error"
+		slog.Error("stripped file is unreadable or empty", "error", err)
+		writeError(w, http.StatusInternalServerError, "strip failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, stripped); err != nil {
+		slog.Error("write response failed", "error", err)
+	}
+}
+
+// fileWriter keeps the temporary file's write error apart from upload errors,
+// so a full disk is not reported as a bad request.
+type fileWriter struct {
+	file *os.File
+	err  error
+}
+
+func (w *fileWriter) Write(data []byte) (int, error) {
+	n, err := w.file.Write(data)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+func writeContextError(w http.ResponseWriter, ctx context.Context) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		writeError(w, http.StatusGatewayTimeout, "strip timed out")
+		return
+	}
+	writeError(w, 499, "request cancelled")
+}
+
+func receiveFile(r *http.Request, dst io.Writer) error {
+	contentType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return errors.New("invalid Content-Type header")
+	}
+	if contentType != "multipart/form-data" {
+		written, err := io.Copy(dst, r.Body)
+		if err != nil {
+			return fmt.Errorf("read file: %w", err)
+		}
+		if written == 0 {
+			return errors.New("empty file body")
+		}
+		return nil
+	}
+
+	if params["boundary"] == "" {
+		return errors.New("multipart boundary is missing")
+	}
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return fmt.Errorf("read multipart body: %w", err)
+	}
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read multipart body: %w", err)
+		}
+		if part.FormName() != "file" {
+			part.Close()
+			continue
+		}
+		written, copyErr := io.Copy(dst, part)
+		part.Close()
+		if copyErr != nil {
+			return fmt.Errorf("read file field: %w", copyErr)
+		}
+		if written == 0 {
+			return errors.New("file field is empty")
+		}
+		return nil
+	}
+	return errors.New("multipart field \"file\" is required")
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
@@ -179,6 +455,18 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
+func positiveEnvInt(key string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, value)
+	}
+	return parsed, nil
+}
+
 func positiveEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -189,4 +477,69 @@ func positiveEnvDuration(key string, fallback time.Duration) (time.Duration, err
 		return 0, fmt.Errorf("%s must be a positive duration, got %q", key, value)
 	}
 	return parsed, nil
+}
+
+func positiveEnvBytes(key string, fallback int64) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := parseByteSize(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a positive byte size such as 26214400 or 25MiB, got %q", key, value)
+	}
+	return parsed, nil
+}
+
+func parseByteSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("empty byte size")
+	}
+	upper := strings.ToUpper(value)
+	for _, unit := range []struct {
+		suffix string
+		bytes  int64
+	}{
+		{"GIB", 1 << 30},
+		{"MIB", 1 << 20},
+		{"KIB", 1 << 10},
+		{"GB", 1_000_000_000},
+		{"MB", 1_000_000},
+		{"KB", 1_000},
+		{"B", 1},
+	} {
+		if !strings.HasSuffix(upper, unit.suffix) {
+			continue
+		}
+		number := strings.TrimSpace(value[:len(value)-len(unit.suffix)])
+		parsed, err := strconv.ParseInt(number, 10, 64)
+		if err != nil || parsed < 1 {
+			return 0, fmt.Errorf("invalid byte size %q", value)
+		}
+		if parsed > math.MaxInt64/unit.bytes {
+			return 0, fmt.Errorf("byte size %q overflows", value)
+		}
+		return parsed * unit.bytes, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 1 {
+		return 0, fmt.Errorf("invalid byte size %q", value)
+	}
+	return parsed, nil
+}
+
+func formatByteSize(n int64) string {
+	switch {
+	case n <= 0:
+		return fmt.Sprintf("%d bytes", n)
+	case n%(1<<30) == 0:
+		return fmt.Sprintf("%d GiB", n>>30)
+	case n%(1<<20) == 0:
+		return fmt.Sprintf("%d MiB", n>>20)
+	case n%(1<<10) == 0:
+		return fmt.Sprintf("%d KiB", n>>10)
+	default:
+		return fmt.Sprintf("%d bytes", n)
+	}
 }

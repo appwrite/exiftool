@@ -14,13 +14,17 @@ import (
 )
 
 type telemetry struct {
-	registry     *prometheus.Registry
-	httpRequests *prometheus.CounterVec
-	httpDuration *prometheus.HistogramVec
-	httpActive   prometheus.Gauge
+	registry      *prometheus.Registry
+	httpRequests  *prometheus.CounterVec
+	httpDuration  *prometheus.HistogramVec
+	httpActive    prometheus.Gauge
+	stageDuration *prometheus.HistogramVec
+	strips        *prometheus.CounterVec
+	stripActive   prometheus.Gauge
+	cancellations *prometheus.CounterVec
 }
 
-func newTelemetry(exiftoolVersion string) *telemetry {
+func newTelemetry(exiftoolVersion string, maxConcurrentStrips int) *telemetry {
 	registry := prometheus.NewRegistry()
 	t := &telemetry{
 		registry: registry,
@@ -36,14 +40,32 @@ func newTelemetry(exiftoolVersion string) *telemetry {
 			Namespace: "exiftool", Subsystem: "http", Name: "requests_active",
 			Help: "HTTP requests currently being served.",
 		}),
+		stageDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "exiftool", Name: "stage_duration_seconds",
+			Help: "Strip pipeline stage duration.",
+		}, []string{"stage"}),
+		strips: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "exiftool", Name: "strips_total",
+			Help: "Strip requests by outcome.",
+		}, []string{"outcome"}),
+		stripActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "exiftool", Name: "strip_active",
+			Help: "ExifTool commands currently running.",
+		}),
+		cancellations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "exiftool", Name: "cancellations_total",
+			Help: "Cancelled strips by reason.",
+		}, []string{"reason"}),
 	}
 	registry.MustRegister(t.httpRequests, t.httpDuration, t.httpActive,
+		t.stageDuration, t.strips, t.stripActive, t.cancellations,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Namespace: "exiftool", Name: "build_info", Help: "Build and ExifTool version.",
+		Namespace: "exiftool", Name: "build_info", Help: "Build, ExifTool version, and pool size.",
 		ConstLabels: prometheus.Labels{
 			"version": version, "commit": commit, "exiftool_version": exiftoolVersion,
+			"max_concurrent_strips": strconv.Itoa(maxConcurrentStrips),
 		},
 	}, func() float64 { return 1 }))
 	return t
@@ -106,7 +128,7 @@ func (t *telemetry) instrument(next http.Handler) http.Handler {
 
 func telemetryRoute(path string) string {
 	switch path {
-	case "/livez", "/readyz", "/healthz", "/metrics":
+	case "/strip", "/livez", "/readyz", "/healthz", "/metrics":
 		return path
 	default:
 		return "unmatched"

@@ -26,15 +26,25 @@ Run the unit tests with:
 make test
 ```
 
-They need neither ExifTool nor network access. To also run the tests against
-the pinned ExifTool release:
+They need neither ExifTool nor network access: a fake stripper covers raw and
+multipart uploads, request limits, error responses, deadlines and cancellation,
+bounded uploads and concurrency, temporary file cleanup, and shutdown. To also
+run the tests against the pinned ExifTool release:
 
 ```sh
 make test-integration
 ```
 
 This downloads and verifies ExifTool if it is missing. The integration suite
-fails rather than silently skipping when ExifTool is unavailable.
+tags JPEG, PNG, TIFF, GIF, WebP, AVIF, and HEIC files with a location, camera,
+and capture time, strips them, and checks that every private tag is gone while
+the orientation is kept. A JPEG also checks that its ICC profile is kept byte
+for byte. The non-JPEG and non-PNG fixtures in `internal/exiftool/testdata`
+are 32x24 gradients made with ImageMagick 7.1
+(`magick -size 32x24 gradient:red-blue photo.<format>`). It also covers files ExifTool cannot rewrite, recovery after a timeout
+or an exited process, concurrent requests, and that a failed startup leaves no
+processes behind. It fails rather than silently skipping when ExifTool is
+unavailable.
 
 ## Upgrading ExifTool
 
@@ -48,4 +58,5 @@ checksums in the author's
 
 ```text
 cmd/exiftool-server/   HTTP server, lifecycle, and telemetry
+internal/exiftool/     ExifTool process pool and metadata removal
 ```
