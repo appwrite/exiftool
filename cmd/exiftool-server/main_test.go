@@ -593,3 +593,32 @@ func TestParseByteSize(t *testing.T) {
 		})
 	}
 }
+
+func TestStripSlowUploadTimesOut(t *testing.T) {
+	app := newStripApplication(t, fakeStripper(), 1)
+	server := httptest.NewUnstartedServer(app.telemetry.instrument(app.routes()))
+	// Shorter than the strip timeout, so the server's read deadline fires first.
+	server.Config.ReadTimeout = 100 * time.Millisecond
+	server.Start()
+	t.Cleanup(server.Close)
+
+	body, writer := io.Pipe()
+	t.Cleanup(func() { writer.Close() })
+	go func() {
+		_, _ = writer.Write([]byte("IMAGE"))
+	}()
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/strip", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	res, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusGatewayTimeout)
+	}
+}

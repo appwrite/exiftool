@@ -259,6 +259,16 @@ func (app *application) handleStrip(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	data, err := readFile(r)
 	if err != nil {
+		// The server's read deadline starts before this handler, so a slow upload
+		// can hit it first. The server then also cancels the request context,
+		// which would otherwise look like the client leaving.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			outcome = "timeout"
+			app.telemetry.cancellations.WithLabelValues("deadline").Inc()
+			writeError(w, http.StatusGatewayTimeout, "strip timed out")
+			return
+		}
 		if ctx.Err() != nil {
 			observeCancellation()
 			writeContextError(w, ctx)

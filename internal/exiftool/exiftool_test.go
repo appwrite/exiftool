@@ -315,3 +315,24 @@ func countProcesses(t *testing.T) int {
 	}
 	return count
 }
+
+func TestCloseWakesWaitingStrip(t *testing.T) {
+	pool := newPool(t, 1)
+	path := writeFixture(t, "photo.jpg", warmUpJPEG)
+	proc := <-pool.processes // Hold the only process so the next Strip waits.
+
+	result := make(chan error, 1)
+	go func() { result <- pool.Strip(context.Background(), path) }()
+	time.Sleep(50 * time.Millisecond)
+	go pool.Close()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, errClosed) {
+			t.Fatalf("Strip() error = %v, want errClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Strip() kept waiting after Close")
+	}
+	pool.processes <- proc
+}

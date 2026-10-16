@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -53,7 +52,8 @@ type Pool struct {
 	// Holds exactly size entries while idle. A nil entry is a slot whose
 	// process must be started before use.
 	processes chan *process
-	closed    atomic.Bool
+	// Closed by Close, so callers waiting for a process stop waiting.
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -75,6 +75,7 @@ func New(ctx context.Context, options Options) (*Pool, error) {
 		size:           options.Size,
 		startupTimeout: options.StartupTimeout,
 		processes:      make(chan *process, options.Size),
+		done:           make(chan struct{}),
 	}
 
 	results := make(chan error, options.Size)
@@ -110,7 +111,7 @@ func (p *Pool) Strip(ctx context.Context, path string) error {
 	if !filepath.IsAbs(path) || strings.ContainsAny(path, "\r\n") {
 		return errors.New("path must be absolute and must not contain line breaks")
 	}
-	if p.closed.Load() {
+	if p.isClosed() {
 		return errClosed
 	}
 	if err := ctx.Err(); err != nil {
@@ -122,8 +123,10 @@ func (p *Pool) Strip(ctx context.Context, path string) error {
 	case proc = <-p.processes:
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-p.done:
+		return errClosed
 	}
-	if p.closed.Load() {
+	if p.isClosed() {
 		p.processes <- proc
 		return errClosed
 	}
@@ -155,13 +158,22 @@ func (p *Pool) Strip(ctx context.Context, path string) error {
 // Close stops every process, waiting for strips in progress to finish.
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
-		p.closed.Store(true)
+		close(p.done)
 		for range p.size {
 			if proc := <-p.processes; proc != nil {
 				proc.close()
 			}
 		}
 	})
+}
+
+func (p *Pool) isClosed() bool {
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Pool) start(ctx context.Context) (*process, error) {
