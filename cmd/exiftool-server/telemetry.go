@@ -116,9 +116,10 @@ func (t *telemetry) instrument(next http.Handler) http.Handler {
 				status = http.StatusOK
 			}
 			duration := time.Since(started)
-			t.httpRequests.WithLabelValues(route, r.Method, strconv.Itoa(status)).Inc()
-			t.httpDuration.WithLabelValues(route, r.Method).Observe(duration.Seconds())
-			slog.Info("request completed", "request_id", requestID, "method", r.Method,
+			method := telemetryMethod(r.Method)
+			t.httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+			t.httpDuration.WithLabelValues(route, method).Observe(duration.Seconds())
+			slog.Info("request completed", "request_id", requestID, "method", loggedMethod(r.Method),
 				"route", route, "status", status, "response_bytes", recorder.bytes,
 				"duration_ms", duration.Milliseconds())
 		}()
@@ -133,6 +134,26 @@ func telemetryRoute(path string) string {
 	default:
 		return "unmatched"
 	}
+}
+
+const maxLoggedMethodLen = 32
+
+func telemetryMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodConnect,
+		http.MethodOptions, http.MethodTrace:
+		return method
+	default:
+		return "other"
+	}
+}
+
+func loggedMethod(method string) string {
+	if len(method) <= maxLoggedMethodLen {
+		return method
+	}
+	return method[:maxLoggedMethodLen] + "..."
 }
 
 func validRequestID(value string) string {
