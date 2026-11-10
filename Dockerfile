@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 
-FROM golang:1.27-trixie AS builder
+FROM golang:1.27-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80 AS builder
 ARG VERSION=dev
 ARG COMMIT=unknown
 ADD --checksum=sha256:5f4c81d34ad406538c2871ad72dbfceb5d9b412b2f16cbbeb4d712d270846667 \
@@ -17,7 +17,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /out/exiftool-server ./cmd/exiftool-server
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl perl \
     && rm -rf /var/lib/apt/lists/*
